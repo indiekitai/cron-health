@@ -103,6 +103,34 @@ hourly-sync     ● LATE  1h             1 hour ago     overdue
 weekly-report   ● DOWN  0 9 * * 1      10 days ago    overdue
 ```
 
+#### JSON Output
+
+```bash
+cron-health list --json
+```
+
+Output:
+```json
+[
+  {
+    "name": "daily-backup",
+    "status": "OK",
+    "interval": "24h",
+    "cron": "",
+    "last_ping": "2024-01-15T10:30:00Z",
+    "next_expected": "2024-01-16T02:00:00Z"
+  },
+  {
+    "name": "nightly-job",
+    "status": "LATE",
+    "interval": "",
+    "cron": "0 2 * * *",
+    "last_ping": "2024-01-14T02:00:00Z",
+    "next_expected": "2024-01-15T02:00:00Z"
+  }
+]
+```
+
 ### `cron-health status [name]`
 
 Show detailed status of a specific monitor or all monitors.
@@ -133,6 +161,39 @@ Next expected: 2024-01-16 02:00:00 (in 15h30m)
 Created: 2024-01-01 10:00:00
 ```
 
+#### Quiet Mode
+
+Output only the status string (useful for scripting):
+
+```bash
+# Single monitor
+cron-health status daily-backup --quiet
+# Output: OK
+
+# All monitors (outputs worst status)
+cron-health status --quiet
+# Output: LATE
+```
+
+#### JSON Output
+
+```bash
+cron-health status daily-backup --json
+```
+
+Output:
+```json
+{
+  "name": "daily-backup",
+  "status": "OK",
+  "interval": "24h",
+  "grace": "1h",
+  "last_ping": "2024-01-15T02:05:23Z",
+  "next_expected": "2024-01-16T02:00:00Z",
+  "created_at": "2024-01-01T10:00:00Z"
+}
+```
+
 ### `cron-health delete <name>`
 
 Delete a monitor and its ping history.
@@ -157,6 +218,26 @@ TIMESTAMP            TYPE
 2024-01-15 02:05:23  ✓ success
 2024-01-14 02:03:45  ✓ success
 2024-01-13 02:04:12  ✓ success
+```
+
+#### JSON Output
+
+```bash
+cron-health logs daily-backup --json
+```
+
+Output:
+```json
+[
+  {
+    "timestamp": "2024-01-15T02:05:23Z",
+    "type": "success"
+  },
+  {
+    "timestamp": "2024-01-14T02:03:45Z",
+    "type": "success"
+  }
+]
 ```
 
 ### `cron-health badge <name>`
@@ -265,6 +346,36 @@ Monitors transition through these states:
 ```
 
 For cron-based monitors, the "next expected" time is calculated from the cron expression after each successful ping.
+
+## Exit Codes
+
+The `list` and `status` commands use semantic exit codes for scripting:
+
+| Exit Code | Meaning |
+|-----------|---------|
+| 0 | All monitors OK |
+| 1 | At least one monitor LATE |
+| 2 | At least one monitor DOWN |
+
+### Examples
+
+```bash
+# Check if anything is wrong
+cron-health status --quiet || echo "Something is wrong!"
+
+# Script based on exit code
+cron-health status --quiet
+case $? in
+  0) echo "All healthy" ;;
+  1) echo "Warning: some jobs late" ;;
+  2) echo "Critical: some jobs down" ;;
+esac
+
+# Use in CI/CD or monitoring scripts
+if ! cron-health status --quiet > /dev/null; then
+  send_alert "cron-health detected issues"
+fi
+```
 
 ## Configuration
 

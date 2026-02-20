@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/fatih/color"
@@ -10,6 +12,23 @@ import (
 	"github.com/indiekitai/cron-health/internal/db"
 	"github.com/indiekitai/cron-health/internal/monitor"
 )
+
+var statusJSON bool
+var statusQuiet bool
+
+// StatusJSON represents detailed status in JSON format
+type StatusJSON struct {
+	Name            string `json:"name"`
+	Status          string `json:"status"`
+	Interval        string `json:"interval,omitempty"`
+	Cron            string `json:"cron,omitempty"`
+	Grace           string `json:"grace,omitempty"`
+	LastPing        string `json:"last_ping,omitempty"`
+	NextExpected    string `json:"next_expected,omitempty"`
+	CreatedAt       string `json:"created_at"`
+	GraceRemaining  string `json:"grace_remaining,omitempty"`
+	OverdueBy       string `json:"overdue_by,omitempty"`
+}
 
 var statusCmd = &cobra.Command{
 	Use:   "status [name]",
@@ -31,8 +50,37 @@ var statusCmd = &cobra.Command{
 			}
 
 			if len(monitors) == 0 {
-				fmt.Println("No monitors configured.")
+				if !statusQuiet && !statusJSON {
+					fmt.Println("No monitors configured.")
+				}
+				if statusJSON {
+					fmt.Println("[]")
+				}
 				return nil
+			}
+
+			// Calculate worst status for exit code and quiet mode
+			worstStatus := "OK"
+			exitCode := 0
+			for _, m := range monitors {
+				status := monitor.CalculateStatus(m)
+				code := statusToExitCode(status)
+				if code > exitCode {
+					exitCode = code
+					worstStatus = status
+				}
+			}
+
+			if statusQuiet {
+				fmt.Println(worstStatus)
+				if exitCode > 0 {
+					os.Exit(exitCode)
+				}
+				return nil
+			}
+
+			if statusJSON {
+				return outputStatusJSON(monitors, exitCode)
 			}
 
 			for i, m := range monitors {
@@ -40,6 +88,10 @@ var statusCmd = &cobra.Command{
 					fmt.Println()
 				}
 				printMonitorStatus(m)
+			}
+
+			if exitCode > 0 {
+				os.Exit(exitCode)
 			}
 			return nil
 		}
@@ -51,9 +103,114 @@ var statusCmd = &cobra.Command{
 			return fmt.Errorf("monitor '%s' not found", name)
 		}
 
+		status := monitor.CalculateStatus(m)
+		exitCode := statusToExitCode(status)
+
+		if statusQuiet {
+			fmt.Println(status)
+			if exitCode > 0 {
+				os.Exit(exitCode)
+			}
+			return nil
+		}
+
+		if statusJSON {
+			return outputStatusJSON([]*db.Monitor{m}, exitCode)
+		}
+
 		printMonitorStatus(m)
+
+		if exitCode > 0 {
+			os.Exit(exitCode)
+		}
 		return nil
 	},
+}
+
+func outputStatusJSON(monitors []*db.Monitor, exitCode int) error {
+	var result []StatusJSON
+
+	for _, m := range monitors {
+		status := monitor.CalculateStatus(m)
+		grace := time.Duration(m.GraceSeconds) * time.Second
+
+		sj := StatusJSON{
+			Name:      m.Name,
+			Status:    status,
+			CreatedAt: m.CreatedAt.Format(time.RFC3339),
+		}
+
+		if m.IntervalSeconds > 0 && m.CronExpr == "" {
+			interval := time.Duration(m.IntervalSeconds) * time.Second
+			sj.Interval = monitor.FormatDuration(interval)
+		}
+
+		if m.CronExpr != "" {
+			sj.Cron = m.CronExpr
+		}
+
+		if grace > 0 {
+			sj.Grace = monitor.FormatDuration(grace)
+		}
+
+		if m.LastPing != nil {
+			sj.LastPing = m.LastPing.Format(time.RFC3339)
+		}
+
+		if m.NextExpected != nil {
+			sj.NextExpected = m.NextExpected.Format(time.RFC3339)
+
+			now := time.Now()
+			if now.After(*m.NextExpected) && now.Before(m.NextExpected.Add(grace)) {
+				remaining := time.Until(m.NextExpected.Add(grace))
+				sj.GraceRemaining = monitor.FormatDuration(remaining)
+			} else if now.After(m.NextExpected.Add(grace)) {
+				overdue := time.Since(m.NextExpected.Add(grace))
+				sj.OverdueBy = monitor.FormatDuration(overdue)
+			}
+		} else if m.LastPing != nil && m.IntervalSeconds > 0 {
+			interval := time.Duration(m.IntervalSeconds) * time.Second
+			nextTime := m.LastPing.Add(interval)
+			sj.NextExpected = nextTime.Format(time.RFC3339)
+
+			elapsed := time.Since(*m.LastPing)
+			if elapsed > interval && elapsed < interval+grace {
+				remaining := interval + grace - elapsed
+				sj.GraceRemaining = monitor.FormatDuration(remaining)
+			} else if elapsed > interval+grace {
+				overdue := elapsed - interval - grace
+				sj.OverdueBy = monitor.FormatDuration(overdue)
+			}
+		}
+
+		result = append(result, sj)
+	}
+
+	// Output single object if only one monitor, array otherwise
+	var output []byte
+	var err error
+	if len(result) == 1 {
+		output, err = json.MarshalIndent(result[0], "", "  ")
+	} else {
+		if result == nil {
+			result = []StatusJSON{}
+		}
+		output, err = json.MarshalIndent(result, "", "  ")
+	}
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+	fmt.Println(string(output))
+
+	if exitCode > 0 {
+		os.Exit(exitCode)
+	}
+	return nil
+}
+
+func init() {
+	statusCmd.Flags().BoolVarP(&statusJSON, "json", "j", false, "Output in JSON format")
+	statusCmd.Flags().BoolVarP(&statusQuiet, "quiet", "q", false, "Output only status (OK, LATE, or DOWN)")
 }
 
 func printMonitorStatus(m *db.Monitor) {
