@@ -36,14 +36,19 @@ var listCmd = &cobra.Command{
 		}
 
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "NAME\tSTATUS\tINTERVAL\tLAST PING\t")
+		fmt.Fprintln(w, "NAME\tSTATUS\tINTERVAL/CRON\tLAST PING\tNEXT EXPECTED\t")
 
 		for _, m := range monitors {
 			status := monitor.CalculateStatus(m)
 			statusStr := formatStatus(status)
 
-			interval := time.Duration(m.IntervalSeconds) * time.Second
-			intervalStr := monitor.FormatDuration(interval)
+			var scheduleStr string
+			if m.CronExpr != "" {
+				scheduleStr = m.CronExpr
+			} else {
+				interval := time.Duration(m.IntervalSeconds) * time.Second
+				scheduleStr = monitor.FormatDuration(interval)
+			}
 
 			var lastPingStr string
 			if m.LastPing != nil {
@@ -52,7 +57,17 @@ var listCmd = &cobra.Command{
 				lastPingStr = "never"
 			}
 
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t\n", m.Name, statusStr, intervalStr, lastPingStr)
+			var nextExpectedStr string
+			if m.NextExpected != nil {
+				nextExpectedStr = monitor.TimeUntil(*m.NextExpected)
+			} else if m.LastPing != nil {
+				nextTime := m.LastPing.Add(time.Duration(m.IntervalSeconds) * time.Second)
+				nextExpectedStr = monitor.TimeUntil(nextTime)
+			} else {
+				nextExpectedStr = "-"
+			}
+
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t\n", m.Name, statusStr, scheduleStr, lastPingStr, nextExpectedStr)
 		}
 
 		w.Flush()

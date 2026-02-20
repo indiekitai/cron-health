@@ -62,10 +62,15 @@ func printMonitorStatus(m *db.Monitor) {
 	fmt.Printf("Monitor: %s\n", color.CyanString(m.Name))
 	fmt.Printf("Status:  %s\n", formatStatusLong(status))
 
-	interval := time.Duration(m.IntervalSeconds) * time.Second
-	grace := time.Duration(m.GraceSeconds) * time.Second
+	// Show schedule (cron or interval)
+	if m.CronExpr != "" {
+		fmt.Printf("Cron:     %s\n", m.CronExpr)
+	} else {
+		interval := time.Duration(m.IntervalSeconds) * time.Second
+		fmt.Printf("Interval: %s\n", monitor.FormatDuration(interval))
+	}
 
-	fmt.Printf("Interval: %s\n", monitor.FormatDuration(interval))
+	grace := time.Duration(m.GraceSeconds) * time.Second
 	if grace > 0 {
 		fmt.Printf("Grace:    %s\n", monitor.FormatDuration(grace))
 	}
@@ -74,9 +79,29 @@ func printMonitorStatus(m *db.Monitor) {
 		fmt.Printf("Last ping: %s (%s)\n",
 			m.LastPing.Format("2006-01-02 15:04:05"),
 			monitor.TimeAgo(*m.LastPing))
+	} else {
+		fmt.Printf("Last ping: never\n")
+	}
 
-		// Time until late/down
+	// Show next expected time
+	if m.NextExpected != nil {
+		// Cron-based: use stored next_expected
+		if time.Now().Before(*m.NextExpected) {
+			fmt.Printf("Next expected: %s (%s)\n",
+				m.NextExpected.Format("2006-01-02 15:04:05"),
+				monitor.TimeUntil(*m.NextExpected))
+		} else if time.Now().Before(m.NextExpected.Add(grace)) {
+			remaining := time.Until(m.NextExpected.Add(grace))
+			fmt.Printf("Grace remaining: %s\n", color.YellowString(monitor.FormatDuration(remaining)))
+		} else {
+			overdue := time.Since(m.NextExpected.Add(grace))
+			fmt.Printf("Overdue by: %s\n", color.RedString(monitor.FormatDuration(overdue)))
+		}
+	} else if m.LastPing != nil {
+		// Interval-based: calculate from last ping
+		interval := time.Duration(m.IntervalSeconds) * time.Second
 		elapsed := time.Since(*m.LastPing)
+
 		if elapsed < interval {
 			remaining := interval - elapsed
 			fmt.Printf("Next expected in: %s\n", monitor.FormatDuration(remaining))
@@ -87,8 +112,6 @@ func printMonitorStatus(m *db.Monitor) {
 			overdue := elapsed - interval - grace
 			fmt.Printf("Overdue by: %s\n", color.RedString(monitor.FormatDuration(overdue)))
 		}
-	} else {
-		fmt.Printf("Last ping: never\n")
 	}
 
 	fmt.Printf("Created: %s\n", m.CreatedAt.Format("2006-01-02 15:04:05"))

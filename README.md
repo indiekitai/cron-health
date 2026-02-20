@@ -7,7 +7,11 @@ A simple CLI tool for monitoring cron jobs. Open source alternative to [healthch
 - **Single binary** - No dependencies, just one executable
 - **SQLite storage** - All data stored locally in `~/.cron-health/data.db`
 - **HTTP ping endpoints** - Simple GET requests to record job status
-- **Webhook notifications** - Get notified when jobs fail
+- **Cron expression support** - Schedule monitors using standard cron syntax
+- **Status badges** - SVG badges for embedding in READMEs or dashboards
+- **Telegram notifications** - Get notified via Telegram when jobs fail
+- **Webhook notifications** - POST to any HTTP endpoint on status changes
+- **Interactive TUI** - Terminal UI dashboard for real-time monitoring
 - **Color-coded output** - Instantly see which jobs are healthy
 
 ## Installation
@@ -35,6 +39,9 @@ cron-health init
 # Create a monitor for daily backup (expect ping every 24h, 1h grace period)
 cron-health create daily-backup --interval 24h --grace 1h
 
+# Or use cron expression
+cron-health create nightly-backup --cron "0 2 * * *" --grace 1h
+
 # Start the HTTP server
 cron-health server --port 8080 &
 
@@ -44,6 +51,9 @@ cron-health server --port 8080 &
 # Check status
 cron-health list
 cron-health status daily-backup
+
+# Launch interactive dashboard
+cron-health tui
 ```
 
 ## Commands
@@ -67,6 +77,12 @@ cron-health create hourly-task --interval 1h
 # With grace period (5 minutes late before marking DOWN)
 cron-health create daily-backup --interval 24h --grace 1h
 
+# Using cron expression (runs at 2am daily)
+cron-health create nightly-backup --cron "0 2 * * *" --grace 1h
+
+# Cron expression for every Monday at 9am
+cron-health create weekly-report --cron "0 9 * * 1"
+
 # Supported duration formats: 30s, 5m, 1h, 1d, 1h30m
 ```
 
@@ -80,10 +96,11 @@ cron-health list
 
 Output:
 ```
-NAME           STATUS    INTERVAL  LAST PING
-daily-backup   ● OK      24h       2 hours ago
-hourly-sync    ● LATE    1h        1 hour ago
-weekly-report  ● DOWN    7d        10 days ago
+NAME            STATUS  INTERVAL/CRON  LAST PING      NEXT EXPECTED
+daily-backup    ● OK    24h            2 hours ago    in 21h55m
+nightly-backup  ● OK    0 2 * * *      8 hours ago    in 15h30m
+hourly-sync     ● LATE  1h             1 hour ago     overdue
+weekly-report   ● DOWN  0 9 * * 1      10 days ago    overdue
 ```
 
 ### `cron-health status [name]`
@@ -102,6 +119,17 @@ Interval: 24h
 Grace:    1h
 Last ping: 2024-01-15 02:05:23 (2 hours ago)
 Next expected in: 21h55m
+Created: 2024-01-01 10:00:00
+```
+
+For cron-based monitors:
+```
+Monitor: nightly-backup
+Status:  OK - Running on schedule
+Cron:     0 2 * * *
+Grace:    1h
+Last ping: 2024-01-15 02:05:23 (8 hours ago)
+Next expected: 2024-01-16 02:00:00 (in 15h30m)
 Created: 2024-01-01 10:00:00
 ```
 
@@ -131,6 +159,48 @@ TIMESTAMP            TYPE
 2024-01-13 02:04:12  ✓ success
 ```
 
+### `cron-health badge <name>`
+
+Generate an SVG status badge for a monitor.
+
+```bash
+# Output badge SVG to file
+cron-health badge daily-backup > badge.svg
+
+# View badge SVG
+cron-health badge daily-backup | cat
+```
+
+The badge shows:
+- **Green** - OK (running on schedule)
+- **Yellow** - LATE (ping overdue)
+- **Red** - DOWN (grace period exceeded)
+- **Gray** - Unknown (monitor not found)
+
+### `cron-health tui`
+
+Launch an interactive terminal UI dashboard.
+
+```bash
+cron-health tui
+```
+
+Keybindings:
+- `j/↓` - Move down
+- `k/↑` - Move up
+- `Enter` - View monitor details
+- `a` - Add new monitor
+- `d` - Delete monitor
+- `r` - Refresh list
+- `q/Esc` - Quit
+
+The TUI auto-refreshes every 5 seconds and shows:
+- Monitor name
+- Current status (with colors)
+- Interval or cron expression
+- Last ping time
+- Next expected ping time
+
 ### `cron-health server`
 
 Start the HTTP server to receive pings.
@@ -157,6 +227,15 @@ When the server is running, these endpoints are available:
 | `GET /ping/<name>/start` | Record that a job has started (optional) |
 | `GET /health` | Health check endpoint |
 | `GET /api/monitors` | JSON list of all monitors |
+| `GET /badge/<name>.svg` | Status badge (SVG image) |
+
+### Badge Endpoint
+
+Embed status badges in your README or dashboard:
+
+```markdown
+![Backup Status](http://localhost:8080/badge/daily-backup.svg)
+```
 
 ### Usage in cron jobs
 
@@ -176,7 +255,7 @@ When the server is running, these endpoints are available:
 Monitors transition through these states:
 
 1. **OK** (green) - Ping received within expected interval
-2. **LATE** (yellow) - Ping is overdue (past interval)
+2. **LATE** (yellow) - Ping is overdue (past interval or next expected time)
 3. **DOWN** (red) - Ping is overdue past the grace period
 
 ```
@@ -185,22 +264,49 @@ Monitors transition through these states:
      |___________________________ [ping received] ___________________|
 ```
 
+For cron-based monitors, the "next expected" time is calculated from the cron expression after each successful ping.
+
 ## Configuration
 
 Configuration is stored at `~/.cron-health/config.yaml`:
 
 ```yaml
-# Webhook URL to POST notifications
-webhook_url: https://your-webhook-url.com/hook
+# Server port
+server_port: 8080
 
 # When to send notifications: late, down, recovered
 notify_on:
+  - late
   - down
   - recovered
 
-# Default server port
-server_port: 8080
+# Notification channels
+notifications:
+  # Telegram notifications
+  telegram:
+    enabled: true
+    bot_token: "123456:ABC-DEF..."
+    chat_id: "-1001234567890"
+
+  # Webhook notifications
+  webhook:
+    enabled: true
+    url: "https://your-webhook-url.com/hook"
 ```
+
+### Telegram Setup
+
+1. Create a bot with [@BotFather](https://t.me/BotFather)
+2. Get your bot token
+3. Get your chat ID (use [@userinfobot](https://t.me/userinfobot) or check the API)
+4. Add the bot to your chat/group
+5. Configure in `config.yaml`
+
+Telegram messages include:
+- Monitor name
+- Status change (OK → LATE → DOWN)
+- Timestamp
+- Emoji indicators (✅ OK, ⚠️ LATE, 🔴 DOWN)
 
 ### Webhook Payload
 
@@ -261,7 +367,7 @@ All data is stored in `~/.cron-health/`:
 
 ```bash
 # Create the monitor
-cron-health create nightly-backup --interval 24h --grace 2h
+cron-health create nightly-backup --cron "0 3 * * *" --grace 2h
 
 # Add to crontab
 # 0 3 * * * /opt/backup/run.sh && curl -s http://localhost:8080/ping/nightly-backup
@@ -271,19 +377,29 @@ cron-health create nightly-backup --interval 24h --grace 2h
 
 ```bash
 cron-health create db-cleanup --interval 1h --grace 10m
-cron-health create log-rotate --interval 24h --grace 1h
+cron-health create log-rotate --cron "0 0 * * *" --grace 1h
 cron-health create health-check --interval 5m --grace 2m
 ```
 
 ### Integrate with notification services
 
-Configure webhook to send to Slack, Discord, or any HTTP endpoint:
+Configure Telegram and webhook notifications:
 
 ```yaml
-webhook_url: https://hooks.slack.com/services/YOUR/WEBHOOK/URL
 notify_on:
+  - late
   - down
   - recovered
+
+notifications:
+  telegram:
+    enabled: true
+    bot_token: "123456:ABC-DEF..."
+    chat_id: "-100123456789"
+
+  webhook:
+    enabled: true
+    url: "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
 ```
 
 ## License

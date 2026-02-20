@@ -12,23 +12,28 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/indiekitai/cron-health/internal/badge"
 	"github.com/indiekitai/cron-health/internal/config"
+	"github.com/indiekitai/cron-health/internal/cron"
 	"github.com/indiekitai/cron-health/internal/db"
 	"github.com/indiekitai/cron-health/internal/monitor"
+	"github.com/indiekitai/cron-health/internal/notify"
 )
 
 type Server struct {
-	db     *db.DB
-	cfg    *config.Config
-	port   int
-	server *http.Server
+	db       *db.DB
+	cfg      *config.Config
+	port     int
+	server   *http.Server
+	notifier *notify.Notifier
 }
 
 func New(database *db.DB, cfg *config.Config, port int) *Server {
 	return &Server{
-		db:   database,
-		cfg:  cfg,
-		port: port,
+		db:       database,
+		cfg:      cfg,
+		port:     port,
+		notifier: notify.New(cfg),
 	}
 }
 
@@ -37,6 +42,7 @@ func (s *Server) Start(daemon bool) error {
 	mux.HandleFunc("/ping/", s.handlePing)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/monitors", s.handleAPIMonitors)
+	mux.HandleFunc("/badge/", s.handleBadge)
 
 	s.server = &http.Server{
 		Addr:         fmt.Sprintf(":%d", s.port),
@@ -79,10 +85,11 @@ func (s *Server) Start(daemon bool) error {
 	// Foreground mode
 	log.Printf("cron-health server listening on port %d", s.port)
 	log.Printf("Endpoints:")
-	log.Printf("  GET /ping/<name>       - Record successful ping")
-	log.Printf("  GET /ping/<name>/fail  - Record failed ping")
-	log.Printf("  GET /ping/<name>/start - Record job started")
-	log.Printf("  GET /health            - Health check")
+	log.Printf("  GET /ping/<name>        - Record successful ping")
+	log.Printf("  GET /ping/<name>/fail   - Record failed ping")
+	log.Printf("  GET /ping/<name>/start  - Record job started")
+	log.Printf("  GET /health             - Health check")
+	log.Printf("  GET /badge/<name>.svg   - Status badge")
 
 	go func() {
 		sigChan := make(chan os.Signal, 1)
@@ -124,19 +131,30 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	}
 
 	oldStatus := m.Status
-	if err := s.db.RecordPing(m.ID, pingType); err != nil {
+
+	// Calculate next expected time for cron-based monitors
+	var nextExpected *time.Time
+	if m.CronExpr != "" && pingType == "success" {
+		parser := cron.New()
+		next, err := parser.NextRunNow(m.CronExpr)
+		if err == nil {
+			nextExpected = &next
+		}
+	}
+
+	if err := s.db.RecordPingWithNextExpected(m.ID, pingType, nextExpected); err != nil {
 		http.Error(w, "Failed to record ping", http.StatusInternalServerError)
 		return
 	}
 
 	// Check for status change notification
-	if pingType == "success" && oldStatus != "OK" && s.cfg.WebhookURL != "" {
-		for _, n := range s.cfg.NotifyOn {
-			if n == "recovered" {
-				go sendNotification(s.cfg.WebhookURL, name, oldStatus, "OK")
-				break
-			}
-		}
+	if pingType == "success" && oldStatus != "OK" {
+		s.notifier.Notify(notify.StatusChange{
+			MonitorName: name,
+			OldStatus:   oldStatus,
+			NewStatus:   "OK",
+			Timestamp:   time.Now(),
+		})
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -166,6 +184,30 @@ func (s *Server) handleAPIMonitors(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(monitors)
 }
 
+func (s *Server) handleBadge(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/badge/")
+	name := strings.TrimSuffix(path, ".svg")
+
+	if name == "" {
+		http.Error(w, "Monitor name required", http.StatusBadRequest)
+		return
+	}
+
+	m, err := s.db.GetMonitorByName(name)
+	if err != nil || m == nil {
+		// Return a gray "unknown" badge
+		w.Header().Set("Content-Type", "image/svg+xml")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		fmt.Fprint(w, badge.Generate(name, "unknown"))
+		return
+	}
+
+	status := monitor.CalculateStatus(m)
+	w.Header().Set("Content-Type", "image/svg+xml")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	fmt.Fprint(w, badge.Generate(m.Name, status))
+}
+
 func (s *Server) statusChecker(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -180,26 +222,4 @@ func (s *Server) statusChecker(ctx context.Context) {
 			}
 		}
 	}
-}
-
-func sendNotification(webhookURL, monitorName, oldStatus, newStatus string) {
-	payload := map[string]string{
-		"monitor":    monitorName,
-		"old_status": oldStatus,
-		"new_status": newStatus,
-		"timestamp":  time.Now().Format(time.RFC3339),
-	}
-
-	data, _ := json.Marshal(payload)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	req, _ := http.NewRequest("POST", webhookURL, strings.NewReader(string(data)))
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("Webhook failed: %v", err)
-		return
-	}
-	resp.Body.Close()
 }

@@ -20,6 +20,8 @@ type Monitor struct {
 	Name            string
 	IntervalSeconds int64
 	GraceSeconds    int64
+	CronExpr        string     // Cron expression (e.g., "0 2 * * *")
+	NextExpected    *time.Time // Next expected ping time (calculated from cron)
 	CreatedAt       time.Time
 	LastPing        *time.Time
 	Status          string // OK, LATE, DOWN
@@ -63,6 +65,7 @@ func (d *DB) Close() error {
 }
 
 func (d *DB) migrate() error {
+	// Initial migration
 	_, err := d.conn.Exec(`
 		CREATE TABLE IF NOT EXISTS monitors (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,14 +88,38 @@ func (d *DB) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_pings_monitor_id ON pings(monitor_id);
 		CREATE INDEX IF NOT EXISTS idx_pings_timestamp ON pings(timestamp);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Add cron_expr column if not exists
+	_, _ = d.conn.Exec(`ALTER TABLE monitors ADD COLUMN cron_expr TEXT DEFAULT ''`)
+
+	// Add next_expected column if not exists
+	_, _ = d.conn.Exec(`ALTER TABLE monitors ADD COLUMN next_expected DATETIME`)
+
+	return nil
 }
 
 func (d *DB) CreateMonitor(name string, intervalSeconds, graceSeconds int64) (*Monitor, error) {
-	result, err := d.conn.Exec(
-		`INSERT INTO monitors (name, interval_seconds, grace_seconds, status) VALUES (?, ?, ?, 'OK')`,
-		name, intervalSeconds, graceSeconds,
-	)
+	return d.CreateMonitorWithCron(name, intervalSeconds, graceSeconds, "", nil)
+}
+
+func (d *DB) CreateMonitorWithCron(name string, intervalSeconds, graceSeconds int64, cronExpr string, nextExpected *time.Time) (*Monitor, error) {
+	var result sql.Result
+	var err error
+
+	if nextExpected != nil {
+		result, err = d.conn.Exec(
+			`INSERT INTO monitors (name, interval_seconds, grace_seconds, cron_expr, next_expected, status) VALUES (?, ?, ?, ?, ?, 'OK')`,
+			name, intervalSeconds, graceSeconds, cronExpr, nextExpected,
+		)
+	} else {
+		result, err = d.conn.Exec(
+			`INSERT INTO monitors (name, interval_seconds, grace_seconds, cron_expr, status) VALUES (?, ?, ?, ?, 'OK')`,
+			name, intervalSeconds, graceSeconds, cronExpr,
+		)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +134,7 @@ func (d *DB) CreateMonitor(name string, intervalSeconds, graceSeconds int64) (*M
 
 func (d *DB) GetMonitor(id int64) (*Monitor, error) {
 	row := d.conn.QueryRow(
-		`SELECT id, name, interval_seconds, grace_seconds, created_at, last_ping, status FROM monitors WHERE id = ?`,
+		`SELECT id, name, interval_seconds, grace_seconds, COALESCE(cron_expr, ''), next_expected, created_at, last_ping, status FROM monitors WHERE id = ?`,
 		id,
 	)
 	return scanMonitor(row)
@@ -115,7 +142,7 @@ func (d *DB) GetMonitor(id int64) (*Monitor, error) {
 
 func (d *DB) GetMonitorByName(name string) (*Monitor, error) {
 	row := d.conn.QueryRow(
-		`SELECT id, name, interval_seconds, grace_seconds, created_at, last_ping, status FROM monitors WHERE name = ?`,
+		`SELECT id, name, interval_seconds, grace_seconds, COALESCE(cron_expr, ''), next_expected, created_at, last_ping, status FROM monitors WHERE name = ?`,
 		name,
 	)
 	return scanMonitor(row)
@@ -123,7 +150,7 @@ func (d *DB) GetMonitorByName(name string) (*Monitor, error) {
 
 func (d *DB) ListMonitors() ([]*Monitor, error) {
 	rows, err := d.conn.Query(
-		`SELECT id, name, interval_seconds, grace_seconds, created_at, last_ping, status FROM monitors ORDER BY name`,
+		`SELECT id, name, interval_seconds, grace_seconds, COALESCE(cron_expr, ''), next_expected, created_at, last_ping, status FROM monitors ORDER BY name`,
 	)
 	if err != nil {
 		return nil, err
@@ -148,6 +175,10 @@ func (d *DB) DeleteMonitor(name string) error {
 }
 
 func (d *DB) RecordPing(monitorID int64, pingType string) error {
+	return d.RecordPingWithNextExpected(monitorID, pingType, nil)
+}
+
+func (d *DB) RecordPingWithNextExpected(monitorID int64, pingType string, nextExpected *time.Time) error {
 	now := time.Now()
 
 	tx, err := d.conn.Begin()
@@ -165,12 +196,19 @@ func (d *DB) RecordPing(monitorID int64, pingType string) error {
 		return err
 	}
 
-	// Update monitor's last_ping and status
+	// Update monitor's last_ping, status, and optionally next_expected
 	if pingType == "success" {
-		_, err = tx.Exec(
-			`UPDATE monitors SET last_ping = ?, status = 'OK' WHERE id = ?`,
-			now, monitorID,
-		)
+		if nextExpected != nil {
+			_, err = tx.Exec(
+				`UPDATE monitors SET last_ping = ?, status = 'OK', next_expected = ? WHERE id = ?`,
+				now, nextExpected, monitorID,
+			)
+		} else {
+			_, err = tx.Exec(
+				`UPDATE monitors SET last_ping = ?, status = 'OK' WHERE id = ?`,
+				now, monitorID,
+			)
+		}
 	} else {
 		_, err = tx.Exec(
 			`UPDATE monitors SET last_ping = ? WHERE id = ?`,
@@ -186,6 +224,11 @@ func (d *DB) RecordPing(monitorID int64, pingType string) error {
 
 func (d *DB) UpdateMonitorStatus(id int64, status string) error {
 	_, err := d.conn.Exec(`UPDATE monitors SET status = ? WHERE id = ?`, status, id)
+	return err
+}
+
+func (d *DB) UpdateNextExpected(id int64, nextExpected time.Time) error {
+	_, err := d.conn.Exec(`UPDATE monitors SET next_expected = ? WHERE id = ?`, nextExpected, id)
 	return err
 }
 
@@ -214,12 +257,16 @@ func (d *DB) GetPings(monitorID int64, limit int) ([]*Ping, error) {
 func scanMonitor(row *sql.Row) (*Monitor, error) {
 	m := &Monitor{}
 	var lastPing sql.NullTime
-	err := row.Scan(&m.ID, &m.Name, &m.IntervalSeconds, &m.GraceSeconds, &m.CreatedAt, &lastPing, &m.Status)
+	var nextExpected sql.NullTime
+	err := row.Scan(&m.ID, &m.Name, &m.IntervalSeconds, &m.GraceSeconds, &m.CronExpr, &nextExpected, &m.CreatedAt, &lastPing, &m.Status)
 	if err != nil {
 		return nil, err
 	}
 	if lastPing.Valid {
 		m.LastPing = &lastPing.Time
+	}
+	if nextExpected.Valid {
+		m.NextExpected = &nextExpected.Time
 	}
 	return m, nil
 }
@@ -227,12 +274,16 @@ func scanMonitor(row *sql.Row) (*Monitor, error) {
 func scanMonitorRows(rows *sql.Rows) (*Monitor, error) {
 	m := &Monitor{}
 	var lastPing sql.NullTime
-	err := rows.Scan(&m.ID, &m.Name, &m.IntervalSeconds, &m.GraceSeconds, &m.CreatedAt, &lastPing, &m.Status)
+	var nextExpected sql.NullTime
+	err := rows.Scan(&m.ID, &m.Name, &m.IntervalSeconds, &m.GraceSeconds, &m.CronExpr, &nextExpected, &m.CreatedAt, &lastPing, &m.Status)
 	if err != nil {
 		return nil, err
 	}
 	if lastPing.Valid {
 		m.LastPing = &lastPing.Time
+	}
+	if nextExpected.Valid {
+		m.NextExpected = &nextExpected.Time
 	}
 	return m, nil
 }

@@ -7,8 +7,29 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type TelegramConfig struct {
+	Enabled  bool   `yaml:"enabled,omitempty"`
+	BotToken string `yaml:"bot_token,omitempty"`
+	ChatID   string `yaml:"chat_id,omitempty"`
+}
+
+type WebhookConfig struct {
+	Enabled bool   `yaml:"enabled,omitempty"`
+	URL     string `yaml:"url,omitempty"`
+}
+
+type NotificationsConfig struct {
+	Telegram TelegramConfig `yaml:"telegram,omitempty"`
+	Webhook  WebhookConfig  `yaml:"webhook,omitempty"`
+}
+
 type Config struct {
-	WebhookURL string   `yaml:"webhook_url,omitempty"`
+	// Legacy field for backward compatibility
+	WebhookURL string `yaml:"webhook_url,omitempty"`
+
+	// New notifications structure
+	Notifications NotificationsConfig `yaml:"notifications,omitempty"`
+
 	NotifyOn   []string `yaml:"notify_on,omitempty"` // late, down, recovered
 	ServerPort int      `yaml:"server_port,omitempty"`
 }
@@ -71,6 +92,12 @@ func Load() (*Config, error) {
 		cfg.NotifyOn = []string{"down", "recovered"}
 	}
 
+	// Migrate legacy webhook_url to new structure
+	if cfg.WebhookURL != "" && cfg.Notifications.Webhook.URL == "" {
+		cfg.Notifications.Webhook.Enabled = true
+		cfg.Notifications.Webhook.URL = cfg.WebhookURL
+	}
+
 	return cfg, nil
 }
 
@@ -104,4 +131,19 @@ func Exists() bool {
 	}
 	_, err = os.Stat(path)
 	return err == nil
+}
+
+// GetEffectiveWebhookURL returns the webhook URL from either the new or legacy config
+func (c *Config) GetEffectiveWebhookURL() string {
+	if c.Notifications.Webhook.Enabled && c.Notifications.Webhook.URL != "" {
+		return c.Notifications.Webhook.URL
+	}
+	return c.WebhookURL
+}
+
+// IsTelegramEnabled returns whether Telegram notifications are enabled
+func (c *Config) IsTelegramEnabled() bool {
+	return c.Notifications.Telegram.Enabled &&
+		c.Notifications.Telegram.BotToken != "" &&
+		c.Notifications.Telegram.ChatID != ""
 }

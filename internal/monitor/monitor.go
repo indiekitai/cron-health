@@ -1,10 +1,7 @@
 package monitor
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -12,6 +9,7 @@ import (
 
 	"github.com/indiekitai/cron-health/internal/config"
 	"github.com/indiekitai/cron-health/internal/db"
+	"github.com/indiekitai/cron-health/internal/notify"
 )
 
 // ParseDuration parses human-readable duration strings like "1h", "30m", "1d", "1h30m"
@@ -58,6 +56,12 @@ func FormatDuration(d time.Duration) string {
 
 // CalculateStatus determines the current status of a monitor
 func CalculateStatus(m *db.Monitor) string {
+	// If using cron expression, use next expected time
+	if m.NextExpected != nil {
+		return calculateStatusFromNextExpected(m)
+	}
+
+	// Original interval-based logic
 	if m.LastPing == nil {
 		// Never pinged - check against creation time
 		elapsed := time.Since(m.CreatedAt)
@@ -86,12 +90,30 @@ func CalculateStatus(m *db.Monitor) string {
 	return "OK"
 }
 
+// calculateStatusFromNextExpected uses the next_expected field for status calculation
+func calculateStatusFromNextExpected(m *db.Monitor) string {
+	now := time.Now()
+	grace := time.Duration(m.GraceSeconds) * time.Second
+
+	if now.Before(*m.NextExpected) {
+		return "OK"
+	}
+
+	if now.Before(m.NextExpected.Add(grace)) {
+		return "LATE"
+	}
+
+	return "DOWN"
+}
+
 // UpdateAllStatuses checks and updates all monitor statuses
 func UpdateAllStatuses(database *db.DB, cfg *config.Config) error {
 	monitors, err := database.ListMonitors()
 	if err != nil {
 		return err
 	}
+
+	notifier := notify.New(cfg)
 
 	for _, m := range monitors {
 		newStatus := CalculateStatus(m)
@@ -101,52 +123,17 @@ func UpdateAllStatuses(database *db.DB, cfg *config.Config) error {
 				return err
 			}
 
-			// Send notification if configured
-			if cfg.WebhookURL != "" {
-				shouldNotify := false
-				for _, n := range cfg.NotifyOn {
-					if (n == "late" && newStatus == "LATE") ||
-						(n == "down" && newStatus == "DOWN") ||
-						(n == "recovered" && newStatus == "OK" && (oldStatus == "LATE" || oldStatus == "DOWN")) {
-						shouldNotify = true
-						break
-					}
-				}
-				if shouldNotify {
-					go sendWebhook(cfg.WebhookURL, m.Name, oldStatus, newStatus)
-				}
-			}
+			// Send notification
+			notifier.Notify(notify.StatusChange{
+				MonitorName: m.Name,
+				OldStatus:   oldStatus,
+				NewStatus:   newStatus,
+				Timestamp:   time.Now(),
+			})
 		}
 	}
 
 	return nil
-}
-
-func sendWebhook(url, monitorName, oldStatus, newStatus string) {
-	payload := map[string]string{
-		"monitor":    monitorName,
-		"old_status": oldStatus,
-		"new_status": newStatus,
-		"timestamp":  time.Now().Format(time.RFC3339),
-	}
-
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return
-	}
-	resp.Body.Close()
 }
 
 // TimeAgo returns a human-readable "time ago" string
@@ -176,4 +163,44 @@ func TimeAgo(t time.Time) string {
 		return "1 day ago"
 	}
 	return fmt.Sprintf("%d days ago", days)
+}
+
+// TimeUntil returns a human-readable "time until" string
+func TimeUntil(t time.Time) string {
+	remaining := time.Until(t)
+	if remaining < 0 {
+		return "overdue"
+	}
+
+	if remaining < time.Minute {
+		return "less than a minute"
+	}
+	if remaining < time.Hour {
+		mins := int(remaining.Minutes())
+		if mins == 1 {
+			return "in 1 minute"
+		}
+		return fmt.Sprintf("in %d minutes", mins)
+	}
+	if remaining < 24*time.Hour {
+		hours := int(remaining.Hours())
+		mins := int(remaining.Minutes()) % 60
+		if hours == 1 && mins == 0 {
+			return "in 1 hour"
+		}
+		if mins == 0 {
+			return fmt.Sprintf("in %d hours", hours)
+		}
+		return fmt.Sprintf("in %dh%dm", hours, mins)
+	}
+
+	days := int(remaining.Hours()) / 24
+	hours := int(remaining.Hours()) % 24
+	if days == 1 && hours == 0 {
+		return "in 1 day"
+	}
+	if hours == 0 {
+		return fmt.Sprintf("in %d days", days)
+	}
+	return fmt.Sprintf("in %dd%dh", days, hours)
 }
