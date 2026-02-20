@@ -1,0 +1,17 @@
+# Binary
+cron-health
+cron-health.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test artifacts
+*.test
+coverage.out
+
+# OS files
+.DS_Store
+Thumbs.db
