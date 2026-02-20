@@ -142,7 +142,18 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := s.db.RecordPingWithNextExpected(m.ID, pingType, nextExpected); err != nil {
+	// Calculate duration if this is a success/fail ping and there was a prior start
+	var durationMs *int64
+	if pingType == "success" || pingType == "fail" {
+		startPing, err := s.db.GetLastStartPing(m.ID)
+		if err == nil && startPing != nil {
+			// Calculate duration from start to now
+			duration := time.Since(startPing.Timestamp).Milliseconds()
+			durationMs = &duration
+		}
+	}
+
+	if err := s.db.RecordPingWithDuration(m.ID, pingType, nextExpected, durationMs); err != nil {
 		http.Error(w, "Failed to record ping", http.StatusInternalServerError)
 		return
 	}

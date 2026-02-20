@@ -18,8 +18,9 @@ var logsJSON bool
 
 // PingJSON represents a ping record in JSON format
 type PingJSON struct {
-	Timestamp string `json:"timestamp"`
-	Type      string `json:"type"`
+	Timestamp  string `json:"timestamp"`
+	Type       string `json:"type"`
+	DurationMs *int64 `json:"duration_ms,omitempty"`
 }
 
 var logsCmd = &cobra.Command{
@@ -58,11 +59,15 @@ var logsCmd = &cobra.Command{
 		fmt.Printf("Ping history for '%s' (last %d):\n\n", name, logsLimit)
 
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "TIMESTAMP\tTYPE\t")
+		fmt.Fprintln(w, "TIMESTAMP\tTYPE\tDURATION\t")
 
 		for _, p := range pings {
 			typeStr := formatPingType(p.Type)
-			fmt.Fprintf(w, "%s\t%s\t\n", p.Timestamp.Format("2006-01-02 15:04:05"), typeStr)
+			durStr := ""
+			if p.DurationMs != nil {
+				durStr = formatDuration(*p.DurationMs)
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t\n", p.Timestamp.Format("2006-01-02 15:04:05"), typeStr, durStr)
 		}
 
 		w.Flush()
@@ -74,10 +79,12 @@ func outputLogsJSON(pings []*db.Ping) error {
 	var result []PingJSON
 
 	for _, p := range pings {
-		result = append(result, PingJSON{
-			Timestamp: p.Timestamp.Format(time.RFC3339),
-			Type:      p.Type,
-		})
+		pj := PingJSON{
+			Timestamp:  p.Timestamp.Format(time.RFC3339),
+			Type:       p.Type,
+			DurationMs: p.DurationMs,
+		}
+		result = append(result, pj)
 	}
 
 	// Output empty array if no pings
@@ -91,6 +98,29 @@ func outputLogsJSON(pings []*db.Ping) error {
 	}
 	fmt.Println(string(output))
 	return nil
+}
+
+func formatDuration(ms int64) string {
+	d := time.Duration(ms) * time.Millisecond
+
+	if d < time.Second {
+		return fmt.Sprintf("%dms", ms)
+	}
+
+	if d < time.Minute {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
+
+	minutes := int(d.Minutes())
+	seconds := int(d.Seconds()) % 60
+
+	if d < time.Hour {
+		return fmt.Sprintf("%dm %02ds", minutes, seconds)
+	}
+
+	hours := int(d.Hours())
+	minutes = minutes % 60
+	return fmt.Sprintf("%dh %02dm %02ds", hours, minutes, seconds)
 }
 
 func formatPingType(t string) string {

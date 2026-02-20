@@ -8,6 +8,9 @@ A simple CLI tool for monitoring cron jobs. Open source alternative to [healthch
 - **SQLite storage** - All data stored locally in `~/.cron-health/data.db`
 - **HTTP ping endpoints** - Simple GET requests to record job status
 - **Cron expression support** - Schedule monitors using standard cron syntax
+- **Duration tracking** - Automatically track how long jobs take to run
+- **Job statistics** - View success rates, duration trends, and run history
+- **Wrap command** - Simplify crontab entries with automatic ping tracking
 - **Status badges** - SVG badges for embedding in READMEs or dashboards
 - **Telegram notifications** - Get notified via Telegram when jobs fail
 - **Webhook notifications** - POST to any HTTP endpoint on status changes
@@ -231,14 +234,78 @@ Output:
 [
   {
     "timestamp": "2024-01-15T02:05:23Z",
-    "type": "success"
+    "type": "success",
+    "duration_ms": 272000
   },
   {
     "timestamp": "2024-01-14T02:03:45Z",
-    "type": "success"
+    "type": "success",
+    "duration_ms": 310000
   }
 ]
 ```
+
+### `cron-health stats <name>`
+
+Show detailed statistics for a monitor including run counts, success rates, and duration metrics.
+
+```bash
+cron-health stats daily-backup
+cron-health stats daily-backup --days 7
+```
+
+Output:
+```
+Job Statistics: daily-backup
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Runs (last 30 days): 30
+Success rate: 96.7%
+
+Duration:
+  Average: 5m 32s
+  Median:  4m 45s
+  Min:     2m 10s
+  Max:     12m 05s
+
+Trend: +10% (getting slower)
+
+Last 5 runs:
+  2026-02-20 02:00  ✓  4m 32s
+  2026-02-19 02:00  ✓  5m 10s
+  2026-02-18 02:00  ✗  failed
+  2026-02-17 02:00  ✓  4m 55s
+  2026-02-16 02:00  ✓  4m 20s
+```
+
+Duration tracking requires using `/ping/<name>/start` before your job runs. The duration is automatically calculated when you send the success/fail ping.
+
+### `cron-health wrap <name> <command>`
+
+Wrap a command with automatic ping tracking. This is the easiest way to monitor a cron job.
+
+```bash
+cron-health wrap daily-backup "/opt/scripts/backup.sh"
+cron-health wrap daily-backup "/opt/scripts/backup.sh" --server http://localhost:8080
+```
+
+The wrap command will:
+1. Send `/ping/<name>/start` to the server
+2. Execute the command
+3. If exit code 0: send `/ping/<name>` (success)
+4. If non-zero exit: send `/ping/<name>/fail`
+5. Pass through stdout/stderr
+6. Exit with the same code as the wrapped command
+
+Example in crontab:
+```bash
+# Old way (manual curl)
+0 2 * * * curl -s http://localhost:8080/ping/backup/start && /opt/backup.sh && curl -s http://localhost:8080/ping/backup || curl -s http://localhost:8080/ping/backup/fail
+
+# New way (wrap command)
+0 2 * * * cron-health wrap backup "/opt/backup.sh" --server http://localhost:8080
+```
+
+The `--server` flag defaults to `http://localhost:8080`.
 
 ### `cron-health badge <name>`
 

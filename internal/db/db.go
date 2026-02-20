@@ -28,10 +28,11 @@ type Monitor struct {
 }
 
 type Ping struct {
-	ID        int64
-	MonitorID int64
-	Type      string // success, fail, start
-	Timestamp time.Time
+	ID         int64
+	MonitorID  int64
+	Type       string // success, fail, start
+	Timestamp  time.Time
+	DurationMs *int64 // Duration in milliseconds (only for success pings with prior start)
 }
 
 func Open() (*DB, error) {
@@ -97,6 +98,9 @@ func (d *DB) migrate() error {
 
 	// Add next_expected column if not exists
 	_, _ = d.conn.Exec(`ALTER TABLE monitors ADD COLUMN next_expected DATETIME`)
+
+	// Add duration_ms column for tracking job duration
+	_, _ = d.conn.Exec(`ALTER TABLE pings ADD COLUMN duration_ms INTEGER`)
 
 	return nil
 }
@@ -179,6 +183,10 @@ func (d *DB) RecordPing(monitorID int64, pingType string) error {
 }
 
 func (d *DB) RecordPingWithNextExpected(monitorID int64, pingType string, nextExpected *time.Time) error {
+	return d.RecordPingWithDuration(monitorID, pingType, nextExpected, nil)
+}
+
+func (d *DB) RecordPingWithDuration(monitorID int64, pingType string, nextExpected *time.Time, durationMs *int64) error {
 	now := time.Now()
 
 	tx, err := d.conn.Begin()
@@ -187,10 +195,10 @@ func (d *DB) RecordPingWithNextExpected(monitorID int64, pingType string, nextEx
 	}
 	defer tx.Rollback()
 
-	// Insert ping record
+	// Insert ping record with optional duration
 	_, err = tx.Exec(
-		`INSERT INTO pings (monitor_id, type, timestamp) VALUES (?, ?, ?)`,
-		monitorID, pingType, now,
+		`INSERT INTO pings (monitor_id, type, timestamp, duration_ms) VALUES (?, ?, ?, ?)`,
+		monitorID, pingType, now, durationMs,
 	)
 	if err != nil {
 		return err
@@ -234,7 +242,7 @@ func (d *DB) UpdateNextExpected(id int64, nextExpected time.Time) error {
 
 func (d *DB) GetPings(monitorID int64, limit int) ([]*Ping, error) {
 	rows, err := d.conn.Query(
-		`SELECT id, monitor_id, type, timestamp FROM pings WHERE monitor_id = ? ORDER BY timestamp DESC LIMIT ?`,
+		`SELECT id, monitor_id, type, timestamp, duration_ms FROM pings WHERE monitor_id = ? ORDER BY timestamp DESC LIMIT ?`,
 		monitorID, limit,
 	)
 	if err != nil {
@@ -245,13 +253,202 @@ func (d *DB) GetPings(monitorID int64, limit int) ([]*Ping, error) {
 	var pings []*Ping
 	for rows.Next() {
 		p := &Ping{}
-		if err := rows.Scan(&p.ID, &p.MonitorID, &p.Type, &p.Timestamp); err != nil {
+		var durationMs sql.NullInt64
+		if err := rows.Scan(&p.ID, &p.MonitorID, &p.Type, &p.Timestamp, &durationMs); err != nil {
 			return nil, err
+		}
+		if durationMs.Valid {
+			p.DurationMs = &durationMs.Int64
 		}
 		pings = append(pings, p)
 	}
 
 	return pings, rows.Err()
+}
+
+// GetLastStartPing returns the most recent start ping for a monitor
+func (d *DB) GetLastStartPing(monitorID int64) (*Ping, error) {
+	row := d.conn.QueryRow(
+		`SELECT id, monitor_id, type, timestamp, duration_ms FROM pings 
+		 WHERE monitor_id = ? AND type = 'start' 
+		 ORDER BY timestamp DESC LIMIT 1`,
+		monitorID,
+	)
+	p := &Ping{}
+	var durationMs sql.NullInt64
+	err := row.Scan(&p.ID, &p.MonitorID, &p.Type, &p.Timestamp, &durationMs)
+	if err != nil {
+		return nil, err
+	}
+	if durationMs.Valid {
+		p.DurationMs = &durationMs.Int64
+	}
+	return p, nil
+}
+
+// PingStats contains statistics for a monitor
+type PingStats struct {
+	TotalRuns    int
+	SuccessCount int
+	FailCount    int
+	AvgDuration  *int64
+	MinDuration  *int64
+	MaxDuration  *int64
+	Durations    []int64 // For calculating median
+}
+
+// GetPingStats returns statistics for a monitor over the last N days
+func (d *DB) GetPingStats(monitorID int64, days int) (*PingStats, error) {
+	since := time.Now().AddDate(0, 0, -days)
+
+	// Get counts
+	var stats PingStats
+
+	// Total runs (success + fail pings, not starts)
+	row := d.conn.QueryRow(
+		`SELECT COUNT(*) FROM pings 
+		 WHERE monitor_id = ? AND type IN ('success', 'fail') AND timestamp >= ?`,
+		monitorID, since,
+	)
+	if err := row.Scan(&stats.TotalRuns); err != nil {
+		return nil, err
+	}
+
+	// Success count
+	row = d.conn.QueryRow(
+		`SELECT COUNT(*) FROM pings 
+		 WHERE monitor_id = ? AND type = 'success' AND timestamp >= ?`,
+		monitorID, since,
+	)
+	if err := row.Scan(&stats.SuccessCount); err != nil {
+		return nil, err
+	}
+
+	// Fail count
+	row = d.conn.QueryRow(
+		`SELECT COUNT(*) FROM pings 
+		 WHERE monitor_id = ? AND type = 'fail' AND timestamp >= ?`,
+		monitorID, since,
+	)
+	if err := row.Scan(&stats.FailCount); err != nil {
+		return nil, err
+	}
+
+	// Duration stats (only for pings with duration_ms set)
+	var avgDur, minDur, maxDur sql.NullInt64
+	row = d.conn.QueryRow(
+		`SELECT AVG(duration_ms), MIN(duration_ms), MAX(duration_ms) FROM pings 
+		 WHERE monitor_id = ? AND duration_ms IS NOT NULL AND timestamp >= ?`,
+		monitorID, since,
+	)
+	if err := row.Scan(&avgDur, &minDur, &maxDur); err != nil {
+		return nil, err
+	}
+	if avgDur.Valid {
+		stats.AvgDuration = &avgDur.Int64
+	}
+	if minDur.Valid {
+		stats.MinDuration = &minDur.Int64
+	}
+	if maxDur.Valid {
+		stats.MaxDuration = &maxDur.Int64
+	}
+
+	// Get all durations for median calculation
+	rows, err := d.conn.Query(
+		`SELECT duration_ms FROM pings 
+		 WHERE monitor_id = ? AND duration_ms IS NOT NULL AND timestamp >= ?
+		 ORDER BY duration_ms`,
+		monitorID, since,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var dur int64
+		if err := rows.Scan(&dur); err != nil {
+			return nil, err
+		}
+		stats.Durations = append(stats.Durations, dur)
+	}
+
+	return &stats, rows.Err()
+}
+
+// GetRecentRuns returns recent runs with their status and duration for stats display
+type RunInfo struct {
+	Timestamp  time.Time
+	Success    bool
+	DurationMs *int64
+}
+
+func (d *DB) GetRecentRuns(monitorID int64, limit int) ([]*RunInfo, error) {
+	rows, err := d.conn.Query(
+		`SELECT timestamp, type, duration_ms FROM pings 
+		 WHERE monitor_id = ? AND type IN ('success', 'fail')
+		 ORDER BY timestamp DESC LIMIT ?`,
+		monitorID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var runs []*RunInfo
+	for rows.Next() {
+		r := &RunInfo{}
+		var pingType string
+		var durationMs sql.NullInt64
+		if err := rows.Scan(&r.Timestamp, &pingType, &durationMs); err != nil {
+			return nil, err
+		}
+		r.Success = pingType == "success"
+		if durationMs.Valid {
+			r.DurationMs = &durationMs.Int64
+		}
+		runs = append(runs, r)
+	}
+
+	return runs, rows.Err()
+}
+
+// GetDurationTrend compares recent duration to older duration
+// Returns percentage change (positive = slower, negative = faster)
+func (d *DB) GetDurationTrend(monitorID int64) (*float64, error) {
+	now := time.Now()
+	recentStart := now.AddDate(0, 0, -7)
+	olderStart := now.AddDate(0, 0, -30)
+
+	// Recent average (last 7 days)
+	var recentAvg sql.NullFloat64
+	row := d.conn.QueryRow(
+		`SELECT AVG(duration_ms) FROM pings 
+		 WHERE monitor_id = ? AND duration_ms IS NOT NULL AND timestamp >= ?`,
+		monitorID, recentStart,
+	)
+	if err := row.Scan(&recentAvg); err != nil {
+		return nil, err
+	}
+
+	// Older average (7-30 days ago)
+	var olderAvg sql.NullFloat64
+	row = d.conn.QueryRow(
+		`SELECT AVG(duration_ms) FROM pings 
+		 WHERE monitor_id = ? AND duration_ms IS NOT NULL AND timestamp >= ? AND timestamp < ?`,
+		monitorID, olderStart, recentStart,
+	)
+	if err := row.Scan(&olderAvg); err != nil {
+		return nil, err
+	}
+
+	if !recentAvg.Valid || !olderAvg.Valid || olderAvg.Float64 == 0 {
+		return nil, nil // Not enough data
+	}
+
+	trend := ((recentAvg.Float64 - olderAvg.Float64) / olderAvg.Float64) * 100
+	return &trend, nil
 }
 
 func scanMonitor(row *sql.Row) (*Monitor, error) {
