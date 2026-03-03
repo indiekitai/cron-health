@@ -1,3 +1,5 @@
+[English](README.md) | [中文](README.zh-CN.md)
+
 # cron-health
 
 A simple CLI tool for monitoring cron jobs. Open source alternative to [healthchecks.io](https://healthchecks.io).
